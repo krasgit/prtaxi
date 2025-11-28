@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="bg">
+<head>
+<meta charset="utf-8">
+<title>OSM Canvas + OSRM Routes + Marker Tooltip + Steps + Delete Button</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;font-family:sans-serif;}
+#mapCanvas{width:100%;height:100%;display:block;cursor:grab;background:#ccc;}
+#controls{position:absolute;top:10px;left:10px;background:rgba(255,255,255,0.9);border-radius:6px;padding:6px;font-size:14px;}
+#controls button{border:none;background:#4a90e2;color:white;font-size:18px;width:32px;height:32px;margin:2px;border-radius:4px;cursor:pointer;}
+#controls button:hover{background:#357ab8;}
+#markerList, #stepList{position:absolute;top:10px;right:10px;background:rgba(255,255,255,0.95);border-radius:6px;padding:6px;font-size:14px;max-height:90%;overflow:auto;}
+#stepList{top:250px;width:250px;}
+#markerMenu{position:absolute;display:none;background:white;border:1px solid #333;border-radius:4px;padding:4px;z-index:1000;}
+.markerItem{border-bottom:1px solid #ccc;margin-bottom:4px;padding-bottom:2px;cursor:move;}
+.markerItem input{width:60px;}
+.stepItem{margin-bottom:2px;cursor:pointer;}
+.stepItem:hover{background:rgba(100,200,255,0.3);}
+</style>
+</head>
+<body>
+
+<canvas id="mapCanvas"></canvas>
+
+<div id="controls">
+  <button id="zoomIn">+</button>
+  <button id="zoomOut">−</button>
+  <button id="exportGPX">💾 Export GPX</button>
+  <span id="coords"></span>
+</div>
+
+<div id="markerList"></div>
+<div id="stepList"></div>
+
+<div id="markerMenu">
+    <button id="deleteMarkerBtn">🗑️ Изтрий маркер</button>
+</div>
+
+<script>
+const canvas=document.getElementById("mapCanvas");
+const ctx=canvas.getContext("2d");
+const coordsDisplay=document.getElementById("coords");
+const markerListDiv=document.getElementById("markerList");
+const stepListDiv=document.getElementById("stepList");
+
+const TILE_URL="http://localhost:8080/tile/{z}/{x}/{y}.png";
+const tileSize=256;
+
+let zoom=14;
+let center={lat:43.2141,lon:27.9147};
+let markers=[
+    {lat:43.2141, lon:27.9147, name:"Start"},
+    {lat:43.2200, lon:27.9200, name:"End"}
+];
+let routeGeoJSON=null, routeSteps=null, routeMessage="";
+let highlightedRouteIndex = null;
+let highlightedStepIndex = null;
+let hoverMarker=null;
+let tooltipDeleteRect = null;
+
+// -----------------------
+// TILE & GEO HELPERS
+// -----------------------
+function lon2x(lon){return (lon+180)/360;}
+function lat2y(lat){const r=lat*Math.PI/180;return (1-Math.log(Math.tan(r)+1/Math.cos(r))/Math.PI)/2;}
+function x2lon(x){return x*360-180;}
+function y2lat(y){const n=Math.PI-2*Math.PI*y;return (180/Math.PI)*Math.atan(0.5*(Math.exp(n)-Math.exp(-n)));}
+
+// -----------------------
+// TILE CACHE
+// -----------------------
+const tileCache=new Map();
+function getTile(z,x,y){
+  const key=`${z}/${x}/${y}`;
+  if(tileCache.has(key)) return tileCache.get(key);
+  const img=new Image();
+  img.onload=()=>draw();
+  img.src=TILE_URL.replace("{z}",z).replace("{x}",x).replace("{y}",y);
+  tileCache.set(key,img);
+  return img;
+}
+
+// -----------------------
+// ROUTE SIMPLIFY
+// -----------------------
+function simplifyRoute(coords, step=5){
+  if(!coords||coords.length===0) return [];
+  const result=[];
+  for(let i=0;i<coords.length;i+=step) result.push(coords[i]);
+  if(coords.length && coords[coords.length-1] !== result[result.length-1]) result.push(coords[coords.length-1]);
+  return result;
+}
+
+// -----------------------
+// MARKER NAMES CORRECTED
+// -----------------------
+function refreshMarkerNames(){
+    if(markers.length===0) return;
+    markers.forEach((m,i)=>{
+        if(i===0) m.name="Start";
+        else if(i===markers.length-1) m.name="End";
+        else { if(!m.name || m.name==="" || m.name.startsWith("Via")) m.name="Via"+i; }
+    });
+}
+
+// -----------------------
+// DRAW
+// -----------------------
+function draw(){
+  if(!canvas.width||!canvas.height) return;
+  const mapSize=Math.pow(2,zoom)*tileSize;
+  const cx=lon2x(center.lon)*mapSize;
+  const cy=lat2y(center.lat)*mapSize;
+  const startX=cx-canvas.width/2;
+  const startY=cy-canvas.height/2;
+  const max=Math.pow(2,zoom);
+
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  const firstX=Math.floor(startX/tileSize);
+  const firstY=Math.floor(startY/tileSize);
+  const lastX=Math.ceil((startX+canvas.width)/tileSize);
+  const lastY=Math.ceil((startY+canvas.height)/tileSize);
+
+  for(let x=firstX;x<lastX;x++){
+    for(let y=firstY;y<lastY;y++){
+      if(y<0||y>=max) continue;
+      const wx=((x%max)+max)%max;
+      const img=getTile(zoom,wx,y);
+      ctx.drawImage(img,x*tileSize-startX,y*tileSize-startY,tileSize,tileSize);
+    }
+  }
+
+  // routes
+  if(routeGeoJSON){
+    routeGeoJSON.forEach((geo, idx)=>{
+      const coords = simplifyRoute(geo.coordinates);
+      ctx.beginPath();
+      if(idx===highlightedRouteIndex){ctx.lineWidth=6;ctx.strokeStyle="lime";}
+      else{ctx.lineWidth=4;ctx.strokeStyle=idx===0?"red":"orange";ctx.globalAlpha=highlightedRouteIndex!==null?0.5:1;}
+      coords.forEach((c,i)=>{const px=lon2x(c[0])*mapSize-startX;const py=lat2y(c[1])*mapSize-startY;if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);});
+      ctx.stroke();
+      ctx.globalAlpha=1;
+    });
+  }
+
+  // markers + names
+  markers.forEach((m,i)=>{
+    const px=lon2x(m.lon)*mapSize-startX;
+    const py=lat2y(m.lat)*mapSize-startY;
+    ctx.beginPath();
+    ctx.arc(px,py,6,0,2*Math.PI);
+    ctx.fillStyle=i===0?"green":i===markers.length-1?"red":"blue";
+    ctx.fill();
+    ctx.font="14px sans-serif"; ctx.fillStyle="black"; ctx.textAlign="center";
+    ctx.fillText(m.name, px, py-10);
+  });
+
+  // tooltip with delete button
+  tooltipDeleteRect = null;
+  if(hoverMarker){
+      const px = lon2x(hoverMarker.lon)*mapSize - startX;
+      const py = lat2y(hoverMarker.lat)*mapSize - startY;
+      const text = `${hoverMarker.name}\nLat: ${hoverMarker.lat.toFixed(5)}\nLon: ${hoverMarker.lon.toFixed(5)}`;
+      ctx.font="12px sans-serif";
+      ctx.textAlign="left";
+      ctx.textBaseline="top";
+      const lines = text.split("\n");
+      const padding = 4;
+      const width = Math.max(...lines.map(l=>ctx.measureText(l).width)) + padding*2;
+      const height = lines.length*14 + padding*2 + 20; // extra space for button
+
+      ctx.fillStyle="rgba(0,0,0,0.7)";
+      ctx.fillRect(px+10, py-10, width, height);
+
+      ctx.fillStyle="white";
+      lines.forEach((line,i)=>ctx.fillText(line, px+10+padding, py-10+padding + i*14));
+
+      // draw delete button
+      const btnHeight = 16, btnWidth = 50;
+      const btnX = px + 10 + padding;
+      const btnY = py -10 + padding + lines.length*14 + 2;
+      ctx.fillStyle = "red";
+      ctx.fillRect(btnX, btnY, btnWidth, btnHeight);
+      ctx.fillStyle = "white";
+      ctx.font = "12px sans-serif";
+      ctx.fillText("Delete", btnX + 5, btnY + 3);
+
+      tooltipDeleteRect = {x: btnX, y: btnY, w: btnWidth, h: btnHeight, marker:hoverMarker};
+  }
+
+  coordsDisplay.textContent=`Zoom:${zoom} | Lat:${center.lat.toFixed(5)} | Lon:${center.lon.toFixed(5)} ${routeMessage}`;
+  updateMarkerList();
+  updateStepList();
+}
+
+// -----------------------
+// PAN & ZOOM
+// -----------------------
+let drag=false,lastX,lastY,dragMarker=null;
+canvas.addEventListener("mousedown",e=>{
+  const m=pickMarker(e.clientX,e.clientY);
+  if(m) dragMarker=m; else{drag=true;lastX=e.clientX;lastY=e.clientY;}
+});
+canvas.addEventListener("mousemove",e=>{
+  if(dragMarker) moveMarkerTo(dragMarker,e.clientX,e.clientY);
+  else if(drag){moveByPixels(e.clientX-lastX,e.clientY-lastY);lastX=e.clientX;lastY=e.clientY;}
+  const m = pickMarker(e.clientX,e.clientY);
+  if(m !== hoverMarker){hoverMarker=m; draw();}
+});
+canvas.addEventListener("mouseup",()=>{if(dragMarker) updateRoute();dragMarker=null;drag=false;});
+canvas.addEventListener("mouseleave",()=>{drag=false;dragMarker=null; hoverMarker=null; draw();});
+canvas.addEventListener("wheel",e=>{e.preventDefault();setZoom(zoom+(e.deltaY<0?1:-1));});
+
+function moveByPixels(dx,dy){
+  const mapSize=Math.pow(2,zoom)*tileSize;
+  const x=lon2x(center.lon)*mapSize-dx;
+  const y=lat2y(center.lat)*mapSize-dy;
+  center.lon=x2lon(x/mapSize);
+  center.lat=y2lat(y/mapSize);
+  draw();
+}
+function setZoom(z){zoom=Math.min(19,Math.max(1,z));draw();}
+
+// -----------------------
+// MARKER PICK / MOVE
+// -----------------------
+function pickMarker(px,py){
+  const mapSize=Math.pow(2,zoom)*tileSize;
+  const startX=lon2x(center.lon)*mapSize-canvas.width/2;
+  const startY=lat2y(center.lat)*mapSize-canvas.height/2;
+  return markers.find(m=>Math.hypot(px-(lon2x(m.lon)*mapSize-startX),py-(lat2y(m.lat)*mapSize-startY))<10);
+}
+function moveMarkerTo(m,px,py){
+  const mapSize=Math.pow(2,zoom)*tileSize;
+  const startX=lon2x(center.lon)*mapSize-canvas.width/2;
+  const startY=lat2y(center.lat)*mapSize-canvas.height/2;
+  m.lon=x2lon((px+startX)/mapSize);
+  m.lat=y2lat((py+startY)/mapSize);
+  refreshMarkerNames();
+  draw();
+}
+
+// -----------------------
+// ADD MARKER DBLCLICK
+// -----------------------
+canvas.addEventListener("dblclick",e=>{
+  const mapSize=Math.pow(2,zoom)*tileSize;
+  const startX=lon2x(center.lon)*mapSize-canvas.width/2;
+  const startY=lat2y(center.lat)*mapSize-canvas.height/2;
+  markers.push({lat:y2lat((e.clientY+startY)/mapSize),lon:x2lon((e.clientX+startX)/mapSize),name:""});
+  refreshMarkerNames();
+  updateRoute();
+});
+
+// -----------------------
+// CONTEXT MENU
+// -----------------------
+const markerMenu=document.getElementById("markerMenu");
+let contextMarker=null;
+canvas.addEventListener("contextmenu",e=>{
+  e.preventDefault();
+  const m=pickMarker(e.clientX,e.clientY);
+  if(m){contextMarker=m;markerMenu.style.left=e.clientX+"px";markerMenu.style.top=e.clientY+"px";markerMenu.style.display="block";}
+});
+window.addEventListener("click",()=>markerMenu.style.display="none");
+document.getElementById("deleteMarkerBtn").onclick=()=>{
+  if(contextMarker){markers.splice(markers.indexOf(contextMarker),1);contextMarker=null;markerMenu.style.display="none";refreshMarkerNames();updateRoute();}
+};
+
+// -----------------------
+// MARKER PANEL + DRAG REORDER
+// -----------------------
+function updateMarkerList(){
+  markerListDiv.innerHTML="<b>Маркери</b><br><br>";
+  markers.forEach((m,i)=>{
+    const d=document.createElement("div");
+    d.className="markerItem";
+    d.draggable=true;
+    d.dataset.i=i;
+    d.innerHTML=`<b>${m.name}</b><br>
+      Name:<input type='text' value='${m.name}' data-i='${i}' class='mname'><br>
+      Lat:<input type='number' step='0.0001' value='${m.lat.toFixed(5)}' data-i='${i}' class='lat'>
+      Lon:<input type='number' step='0.0001' value='${m.lon.toFixed(5)}' data-i='${i}' class='lon'>
+      <button data-i='${i}' class='delBtn'>🗑️</button><hr>`;
+    markerListDiv.appendChild(d);
+  });
+
+  const btn=document.createElement("button");
+  btn.textContent="➕ Добави маркер";
+  btn.onclick=()=>{markers.push({lat:center.lat,lon:center.lon,name:""}); refreshMarkerNames(); updateRoute();}
+  markerListDiv.appendChild(btn);
+
+  markerListDiv.querySelectorAll(".mname").forEach(inp=>inp.onchange=e=>{markers[parseInt(e.target.dataset.i)].name=e.target.value; draw();});
+  markerListDiv.querySelectorAll(".lat").forEach(inp=>inp.onchange=e=>{markers[parseInt(e.target.dataset.i)].lat=parseFloat(e.target.value);updateRoute();});
+  markerListDiv.querySelectorAll(".lon").forEach(inp=>inp.onchange=e=>{markers[parseInt(e.target.dataset.i)].lon=parseFloat(e.target.value);updateRoute();});
+  markerListDiv.querySelectorAll(".delBtn").forEach(btn=>btn.onclick=e=>{markers.splice(parseInt(e.target.dataset.i),1); refreshMarkerNames(); updateRoute();});
+
+  let dragSrcIndex=null;
+  markerListDiv.querySelectorAll(".markerItem").forEach(item=>{
+    item.addEventListener("dragstart",e=>{dragSrcIndex=parseInt(item.dataset.i);});
+    item.addEventListener("dragover",e=>{e.preventDefault();});
+    item.addEventListener("drop",e=>{
+      e.preventDefault();
+      const dst=parseInt(item.dataset.i);
+      if(dragSrcIndex===null||dragSrcIndex===dst) return;
+      const tmp=markers[dragSrcIndex];
+      markers.splice(dragSrcIndex,1);
+      markers.splice(dst,0,tmp);
+      refreshMarkerNames();
+      updateRoute();
+    });
+  });
+}
+
+// -----------------------
+// OSRM ROUTE + STEPS
+// -----------------------
+async function updateRoute(){
+  if(markers.length<2){routeGeoJSON=null;routeSteps=null;routeMessage="";draw();return;}
+  const coordsStr=markers.map(m=>`${m.lon},${m.lat}`).join(";");
+  try{
+    const res = await fetch(`/osrm/route/v1/driving/${coordsStr}?overview=full&alternatives=true&steps=true&geometries=geojson`);
+    const data = await res.json();
+    if(data.code!=="Ok"){routeGeoJSON=null;routeSteps=null;routeMessage=data.message||"No route";draw();return;}
+    routeGeoJSON=data.routes.map(r=>r.geometry);
+    routeSteps=data.routes.map(r=>r.legs.flatMap(l=>l.steps));
+    routeMessage=`✔ ${data.routes.length} route(s)`;
+  }catch(e){routeGeoJSON=null;routeSteps=null;routeMessage="Грешка";}
+  highlightedRouteIndex=null;
+  draw();
+}
+
+// -----------------------
+// STEP PANEL
+// -----------------------
+function updateStepList(){
+  stepListDiv.innerHTML="<b>Steps</b><br><br>";
+  if(!routeSteps) return;
+  routeSteps[0].forEach((s,i)=>{
+    const d=document.createElement("div");
+    d.className="stepItem";
+    d.dataset.i=i;
+    d.textContent=`${s.maneuver.instruction} (${(s.distance/1000).toFixed(2)} km)`;
+    d.onmouseenter=()=>{highlightedStepIndex=i;drawStepSegment();};
+    d.onmouseleave=()=>{highlightedStepIndex=null;draw();};
+    stepListDiv.appendChild(d);
+  });
+}
+function drawStepSegment(){
+  draw();
+  if(highlightedStepIndex===null || !routeSteps) return;
+  const mapSize=Math.pow(2,zoom)*tileSize;
+  const startX=lon2x(center.lon)*mapSize-canvas.width/2;
+  const startY=lat2y(center.lat)*mapSize-canvas.height/2;
+  const step=routeSteps[0][highlightedStepIndex];
+  ctx.beginPath();
+  step.geometry.coordinates.forEach((c,i)=>{const px=lon2x(c[0])*mapSize-startX;const py=lat2y(c[1])*mapSize-startY;if(i===0) ctx.moveTo(px,py);else ctx.lineTo(px,py);});
+  ctx.strokeStyle="cyan"; ctx.lineWidth=6; ctx.stroke();
+}
+
+// -----------------------
+// HIGHLIGHT ROUTE ON CLICK & TOOLTIP DELETE
+// -----------------------
+canvas.addEventListener("click", e=>{
+  // check tooltip delete click
+  if(tooltipDeleteRect){
+      const r = tooltipDeleteRect;
+      if(e.clientX >= r.x && e.clientX <= r.x + r.w &&
+         e.clientY >= r.y && e.clientY <= r.y + r.h){
+          markers.splice(markers.indexOf(r.marker),1);
+          refreshMarkerNames();
+          updateRoute();
+          tooltipDeleteRect = null;
+          return;
+      }
+  }
+
+  // existing route highlight
+  if(!routeGeoJSON) return;
+  const mapSize=Math.pow(2,zoom)*tileSize;
+  const cx=lon2x(center.lon)*mapSize;
+  const cy=lat2y(center.lat)*mapSize;
+  const startX=cx-canvas.width/2, startY=cy-canvas.height/2;
+  let closestIdx=null,minDist=Infinity;
+  routeGeoJSON.forEach((geo,idx)=>{
+    const coords=geo.coordinates;
+    for(let i=0;i<coords.length-1;i++){
+      const x1=lon2x(coords[i][0])*mapSize-startX;
+      const y1=lat2y(coords[i][1])*mapSize-startY;
+      const x2=lon2x(coords[i+1][0])*mapSize-startX;
+      const y2=lat2y(coords[i+1][1])*mapSize-startY;
+      const dx=x2-x1, dy=y2-y1;
+      const t=((e.clientX-x1)*dx+(e.clientY-y1)*dy)/(dx*dx+dy*dy);
+      const tClamped=Math.max(0,Math.min(1,t));
+      const px=x1+tClamped*dx, py=y1+tClamped*dy;
+      const dist=Math.hypot(px-e.clientX,py-e.clientY);
+      if(dist<minDist){minDist=dist;closestIdx=idx;}
+    }
+  });
+  highlightedRouteIndex=(minDist<10)?closestIdx:null;
+  draw();
+});
+
+// -----------------------
+// GPX EXPORT
+// -----------------------
+document.getElementById("exportGPX").onclick=()=>{
+  let gpx=`<?xml version="1.0" encoding="UTF-8"?><gpx version="1.1" creator="OSM Canvas"><trk><name>Route</name><trkseg>`;
+  markers.forEach(m=>{gpx+=`<trkpt lat="${m.lat}" lon="${m.lon}"><name>${m.name}</name></trkpt>`;});
+  gpx+="</trkseg></trk></gpx>";
+  const blob=new Blob([gpx],{type:"application/gpx+xml"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a"); a.href=url; a.download="route.gpx"; a.click(); URL.revokeObjectURL(url);
+};
+
+// -----------------------
+// INIT
+// -----------------------
+window.addEventListener("load",()=>{canvas.width=innerWidth;canvas.height=innerHeight;refreshMarkerNames();updateRoute();});
+window.addEventListener("resize",()=>{canvas.width=innerWidth;canvas.height=innerHeight;draw();});
+document.getElementById("zoomIn").onclick=()=>setZoom(zoom+1);
+document.getElementById("zoomOut").onclick=()=>setZoom(zoom-1);
+</script>
+
+</body>
+</html>
